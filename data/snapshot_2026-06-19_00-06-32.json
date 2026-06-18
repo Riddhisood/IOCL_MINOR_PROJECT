@@ -1,0 +1,10 @@
+{
+  "timestamp": "2026-06-19 00:06:32",
+  "oil_usd_per_barrel": 84.65,
+  "usd_to_inr": 94.34,
+  "weather": {
+    "city": "Delhi",
+    "temperature_c": 33.6,
+    "windspeed_kph": 8.0
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "timestamp": "2026-06-19 00:29:39",
+  "oil": 84.65,
+  "rate": 94.34,
+  "weather": {
+    "city": "Delhi",
+    "temperature_c": 33.5,
+    "windspeed_kph": 8.1
+  },
+  "city": "Delhi",
+  "currency": "INR"
+}
