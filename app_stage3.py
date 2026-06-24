@@ -1,292 +1,306 @@
 """
-STAGE 3: Desktop Window (tkinter)
------------------------------------
-tkinter is Python's built-in GUI library -- no pip install needed.
-It lets you create windows, buttons, labels, and frames with pure Python.
+STAGE 3 (v2): Desktop GUI — with graceful error handling
+---------------------------------------------------------
+New in this version:
 
-New concepts introduced here:
+  1. LAST KNOWN VALUES — values from the previous successful fetch stay
+     visible while a new fetch is running, with a "(cached)" badge.
 
-  tk.Tk()           - creates the main application window
-  tk.Label()        - a piece of text on screen
-  tk.Button()       - a clickable button
-  tk.Frame()        - an invisible box used to group and position other widgets
-  .grid()           - places a widget at a row/column inside its parent
-  .config()         - changes a widget's properties after it has been created
-  threading.Thread  - runs the fetch in the background so the window does not freeze
-                      while waiting for the internet. Without this, clicking Fetch
-                      would lock up the whole window until all three APIs respond.
-  .after(0, fn)     - safely schedules a UI update from a background thread
-                      (tkinter is not thread-safe, so we never touch widgets
-                       directly from threads -- we schedule updates instead)
+  2. PER-CARD ERROR STATES — if one API fails, that card goes red and
+     shows the exact reason. The other two cards stay normal.
 
-HOW TO RUN:
-    python app_stage3.py
+  3. GLOBAL STATUS BAR — shows a summary message beneath the button:
+     "✅ Saved at 14:30"  or  "⚠ 1 source failed — see cards above"
 
-A window will open. Click "Fetch Now" to pull data and save it.
+  4. BUTTON COOLDOWN — button stays disabled for 3 seconds after a fetch
+     to avoid hammering APIs accidentally.
 """
 
-import csv
-import json
-import threading
-import requests
-from datetime import datetime
-from pathlib import Path
 import tkinter as tk
-from tkinter import font as tkfont
-
-# ---- CONFIG ----
-ALPHA_VANTAGE_API_KEY = "B2ATNTCJ5MQCGT68"
-CITY = "Delhi"
-TARGET_CURRENCY = "INR"
-DATA_DIR = Path("data")
-
-# ---- COLOURS ----
-BG        = "#0f172a"   # dark navy background
-CARD_BG   = "#1e293b"   # slightly lighter card background
-ACCENT    = "#38bdf8"   # sky blue  -- used for the button and headings
-TEXT      = "#f1f5f9"   # near-white text
-SUBTEXT   = "#94a3b8"   # muted grey for labels
-SUCCESS   = "#4ade80"   # green  -- used when fetch succeeds
-WARNING   = "#fb923c"   # orange -- used on errors
+import threading
+from app_stage2 import fetch_and_save
+from app_stage1 import FETCH_ERRORS   # the error store populated by each fetcher
 
 
-# =================== FETCHERS (same as Stage 2) ===================
+# ── TOKENS ────────────────────────────────────────────────────────────────────
+BG          = "#0f172a"
+CARD        = "#1e293b"
+TEXT        = "#f1f5f9"
+MUTED       = "#64748b"
+DIVIDER     = "#334155"
 
-def get_crude_oil_price():
-    url = "https://www.alphavantage.co/query"
-    params = {"function": "WTI", "interval": "daily", "apikey": ALPHA_VANTAGE_API_KEY}
-    data = requests.get(url, params=params, timeout=10).json()
-    try:
-        return float(data["data"][0]["value"])
-    except (KeyError, IndexError, ValueError, TypeError):
-        return None
+C_OIL       = "#f59e0b"   # amber
+C_FX        = "#10b981"   # emerald
+C_WEATHER   = "#38bdf8"   # sky blue
+C_ERROR     = "#ef4444"   # red  — card accent when fetch failed
+C_WARN      = "#f97316"   # orange — e.g. markets closed (soft failure)
+C_BTN       = "#f59e0b"
+C_BTN_HOVER = "#d97706"
+C_BTN_OFF   = "#334155"
 
-def get_usd_exchange_rate(target_currency=TARGET_CURRENCY):
-    data = requests.get("https://api.frankfurter.app/latest",
-                        params={"from": "USD", "to": target_currency}, timeout=10).json()
-    try:
-        return data["rates"][target_currency]
-    except (KeyError, TypeError):
-        return None
+F_APP_TITLE = ("Segoe UI", 16, "bold")
+F_SUBTITLE  = ("Segoe UI",  9)
+F_CARD_HDR  = ("Segoe UI",  8, "bold")
+F_NUMBER    = ("Segoe UI", 34, "bold")
+F_UNIT      = ("Segoe UI",  9)
+F_ERR_MSG   = ("Segoe UI",  8)
+F_BADGE     = ("Segoe UI",  7, "bold")
+F_BTN       = ("Segoe UI", 11, "bold")
+F_STATUS_LBL= ("Segoe UI",  7)
+F_STATUS    = ("Segoe UI",  9)
 
-def get_weather(city=CITY):
-    geo = requests.get("https://geocoding-api.open-meteo.com/v1/search",
-                       params={"name": city, "count": 1}, timeout=10).json()
-    if not geo.get("results"):
-        return None
-    lat = geo["results"][0]["latitude"]
-    lon = geo["results"][0]["longitude"]
-    w = requests.get("https://api.open-meteo.com/v1/forecast",
-                     params={"latitude": lat, "longitude": lon, "current_weather": True},
-                     timeout=10).json()
-    try:
-        cw = w["current_weather"]
-        return {"city": city, "temperature_c": cw["temperature"], "windspeed_kph": cw["windspeed"]}
-    except (KeyError, TypeError):
-        return None
+COOLDOWN_MS = 3000   # milliseconds to wait before re-enabling button
 
 
-# =================== SAVING (same as Stage 2) ===================
-
-def save_snapshot(record):
-    DATA_DIR.mkdir(exist_ok=True)
-    safe_ts = record["timestamp"].replace(":", "-").replace(" ", "_")
-    path = DATA_DIR / f"snapshot_{safe_ts}.json"
-    path.write_text(json.dumps(record, indent=2))
-
-def append_to_log(record):
-    DATA_DIR.mkdir(exist_ok=True)
-    log_path = DATA_DIR / "log.csv"
-    col = f"usd_to_{TARGET_CURRENCY.lower()}"
-    headers = ["timestamp", "oil_usd_per_barrel", col, "city", "temperature_c", "windspeed_kph"]
-    write_header = not log_path.exists()
-    with open(log_path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        if write_header:
-            writer.writeheader()
-        wx = record.get("weather") or {}
-        writer.writerow({
-            "timestamp":         record["timestamp"],
-            "oil_usd_per_barrel": record["oil_usd_per_barrel"],
-            col:                 record["usd_to_inr"],
-            "city":              wx.get("city", ""),
-            "temperature_c":     wx.get("temperature_c", ""),
-            "windspeed_kph":     wx.get("windspeed_kph", ""),
-        })
-
-
-# =================== GUI ===================
-
-class App(tk.Tk):
+# ── DATA CARD WIDGET ──────────────────────────────────────────────────────────
+class DataCard(tk.Frame):
     """
-    We define the whole application as a class that inherits from tk.Tk.
-    Inheriting means our App IS a window -- it has all of tk.Tk's abilities
-    plus the extra things we add inside __init__ and our own methods.
+    A self-contained card for one data point (oil / fx / weather).
+
+    It manages its own visual state:
+      normal(value)  → coloured accent, big number
+      loading()      → dims to "…" while fetching
+      error(reason)  → red accent, shows the reason string
     """
+
+    def __init__(self, parent, title, unit, accent, col, sub_label=False):
+        super().__init__(parent, bg=CARD, padx=22, pady=0)
+        self.grid(row=0, column=col,
+                  padx=(0 if col == 0 else 12), sticky="nsew")
+
+        self._accent  = accent   # original colour, restored after errors
+        self._unit    = unit
+
+        # ── top accent stripe ──
+        self._stripe = tk.Frame(self, height=3, bg=accent)
+        self._stripe.pack(fill="x")
+
+        # ── header row: title + cached badge ──
+        hdr = tk.Frame(self, bg=CARD)
+        hdr.pack(fill="x", pady=(14, 0))
+        tk.Label(hdr, text=title, bg=CARD, fg=MUTED,
+                 font=F_CARD_HDR).pack(side="left")
+        self._badge = tk.Label(hdr, text="", bg=CARD, fg=MUTED, font=F_BADGE)
+        self._badge.pack(side="left", padx=(6, 0))
+
+        # ── big number ──
+        self._num_var = tk.StringVar(value="—")
+        self._num_lbl = tk.Label(self, textvariable=self._num_var,
+                                 bg=CARD, fg=accent, font=F_NUMBER)
+        self._num_lbl.pack(anchor="w", pady=(4, 0))
+
+        # ── unit label ──
+        tk.Label(self, text=unit, bg=CARD, fg=MUTED, font=F_UNIT).pack(anchor="w")
+
+        # ── optional sub-line (weather description / error reason) ──
+        self._sub_var = tk.StringVar(value="")
+        self._sub_lbl = tk.Label(self, textvariable=self._sub_var,
+                                 bg=CARD, fg=TEXT, font=F_ERR_MSG,
+                                 wraplength=200, justify="left")
+        self._sub_lbl.pack(anchor="w", pady=(5, 0))
+
+        tk.Frame(self, bg=CARD, height=18).pack()   # bottom padding
+
+        self._last_good = None   # remembers the last successful value string
+
+
+    def normal(self, value_str, sub=""):
+        """Show a real value with the card's original accent colour."""
+        self._last_good = value_str
+        self._stripe.config(bg=self._accent)
+        self._num_lbl.config(fg=self._accent)
+        self._num_var.set(value_str)
+        self._sub_var.set(sub)
+        self._sub_lbl.config(fg=TEXT)
+        self._badge.config(text="")
+
+
+    def loading(self):
+        """Dim the card while the fetch is running; keep last known value."""
+        if self._last_good:
+            # Show last known value in muted colour so user isn't left with blanks
+            self._num_var.set(self._last_good)
+            self._num_lbl.config(fg=MUTED)
+            self._badge.config(text="CACHED")
+        else:
+            self._num_var.set("…")
+            self._num_lbl.config(fg=MUTED)
+        self._stripe.config(bg=MUTED)
+        self._sub_var.set("")
+
+
+    def error(self, reason="", soft=False):
+        """
+        Mark the card as failed.
+        soft=True  → orange (e.g. markets closed — data exists, just unavailable now)
+        soft=False → red (real error: no internet, bad key, etc.)
+        """
+        colour = C_WARN if soft else C_ERROR
+        self._stripe.config(bg=colour)
+        self._num_lbl.config(fg=colour)
+
+        if self._last_good:
+            # Keep the last value visible with a "STALE" badge
+            self._num_var.set(self._last_good)
+            self._badge.config(text="STALE")
+        else:
+            self._num_var.set("—")
+            self._badge.config(text="")
+
+        self._sub_var.set(reason or "Could not retrieve data")
+        self._sub_lbl.config(fg=colour)
+
+
+# ── MAIN WINDOW ───────────────────────────────────────────────────────────────
+class MonitorApp(tk.Tk):
 
     def __init__(self):
-        super().__init__()                        # set up the window itself
-        self.title("Market & Weather Tracker")
+        super().__init__()
+        self.title("Market & Weather Monitor")
         self.configure(bg=BG)
-        self.resizable(False, False)              # fixed size -- no stretching
+        self.resizable(False, False)
 
-        self._build_ui()
-        self._center_window(520, 480)
+        self._build_header()
+        self._build_cards()
+        self._build_divider()
+        self._build_bottom_bar()
+        self._center_on_screen()
 
-    # ---------- layout ----------
 
-    def _build_ui(self):
-        pad = {"padx": 20, "pady": 8}
+    def _build_header(self):
+        hdr = tk.Frame(self, bg=BG)
+        hdr.pack(fill="x", padx=30, pady=(24, 16))
+        tk.Label(hdr, text="🛢  MARKET & WEATHER MONITOR",
+                 bg=BG, fg=TEXT, font=F_APP_TITLE).pack(anchor="w")
+        tk.Label(hdr, text="IOCL Minor Project  ·  Delhi, India",
+                 bg=BG, fg=MUTED, font=F_SUBTITLE).pack(anchor="w", pady=(2, 0))
 
-        # ---- header ----
-        header = tk.Frame(self, bg=BG)
-        header.pack(fill="x", padx=20, pady=(20, 4))
 
-        tk.Label(header, text="Market & Weather Tracker",
-                 bg=BG, fg=ACCENT,
-                 font=("Segoe UI", 18, "bold")).pack(anchor="w")
-        tk.Label(header, text=f"Crude Oil  |  USD\u2192{TARGET_CURRENCY}  |  {CITY} Weather",
-                 bg=BG, fg=SUBTEXT,
-                 font=("Segoe UI", 10)).pack(anchor="w")
+    def _build_cards(self):
+        row = tk.Frame(self, bg=BG)
+        row.pack(padx=30, pady=(0, 20))
 
-        # ---- cards row ----
-        cards_row = tk.Frame(self, bg=BG)
-        cards_row.pack(fill="x", padx=20, pady=12)
+        self.oil_card     = DataCard(row, "🛢   CRUDE OIL  (WTI)",  "USD / barrel",  C_OIL,     col=0)
+        self.fx_card      = DataCard(row, "💵   USD / INR",          "₹ per dollar",  C_FX,      col=1)
+        self.weather_card = DataCard(row, "🌤   WEATHER  (Delhi)",   "°C",            C_WEATHER, col=2, sub_label=True)
 
-        self.card_oil     = self._make_card(cards_row, "Crude Oil", "WTI", "-- USD/bbl")
-        self.card_fx      = self._make_card(cards_row, "Exchange Rate", f"USD \u2192 {TARGET_CURRENCY}", "--")
-        self.card_weather = self._make_card(cards_row, "Weather", CITY, "--\u00b0C")
 
-        self.card_oil.pack    (side="left", expand=True, fill="both", padx=(0, 6))
-        self.card_fx.pack     (side="left", expand=True, fill="both", padx=6)
-        self.card_weather.pack(side="left", expand=True, fill="both", padx=(6, 0))
+    def _build_divider(self):
+        tk.Frame(self, bg=DIVIDER, height=1).pack(fill="x", padx=30)
 
-        # ---- fetch button ----
+
+    def _build_bottom_bar(self):
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill="x", padx=30, pady=20)
+
         self.btn = tk.Button(
-            self,
-            text="Fetch Now",
-            command=self._on_fetch,
-            bg=ACCENT, fg="#0f172a",
-            activebackground="#7dd3fc",
-            font=("Segoe UI", 12, "bold"),
-            bd=0, relief="flat",
-            padx=20, pady=10,
-            cursor="hand2",
+            bar,
+            text="  🔄  FETCH & SAVE  ",
+            bg=C_BTN, fg="#0f172a",
+            font=F_BTN, relief="flat",
+            cursor="hand2", padx=18, pady=10,
+            command=self._on_click,
         )
-        self.btn.pack(pady=(4, 8))
+        self.btn.pack(side="left")
+        self.btn.bind("<Enter>", lambda e: self.btn.config(bg=C_BTN_HOVER) if str(self.btn["state"]) == "normal" else None)
+        self.btn.bind("<Leave>", lambda e: self.btn.config(bg=C_BTN)       if str(self.btn["state"]) == "normal" else None)
 
-        # ---- log history box ----
-        log_frame = tk.Frame(self, bg=CARD_BG, bd=0)
-        log_frame.pack(fill="both", expand=True, padx=20, pady=(0, 8))
+        status_col = tk.Frame(bar, bg=BG)
+        status_col.pack(side="left", padx=20)
+        tk.Label(status_col, text="STATUS", bg=BG, fg=MUTED, font=F_STATUS_LBL).pack(anchor="w")
+        self.status_var = tk.StringVar(value="Ready — click to fetch")
+        tk.Label(status_col, textvariable=self.status_var,
+                 bg=BG, fg=TEXT, font=F_STATUS).pack(anchor="w")
 
-        tk.Label(log_frame, text="Fetch history",
-                 bg=CARD_BG, fg=SUBTEXT,
-                 font=("Segoe UI", 9)).pack(anchor="w", padx=10, pady=(6, 0))
 
-        self.log_box = tk.Text(
-            log_frame,
-            bg=CARD_BG, fg=TEXT,
-            font=("Consolas", 9),
-            bd=0, highlightthickness=0,
-            state="disabled",     # read-only; we enable briefly to insert text
-            height=5,
-        )
-        self.log_box.pack(fill="both", expand=True, padx=10, pady=(2, 8))
+    # ── FETCH FLOW ────────────────────────────────────────────────────────────
 
-        # ---- status bar ----
-        self.status_var = tk.StringVar(value="Ready -- click Fetch Now to begin")
-        tk.Label(self, textvariable=self.status_var,
-                 bg=BG, fg=SUBTEXT,
-                 font=("Segoe UI", 9)).pack(pady=(0, 14))
+    def _on_click(self):
+        self.btn.config(text="  ⏳  FETCHING...  ", state="disabled", bg=C_BTN_OFF)
+        self.status_var.set("Contacting APIs…")
 
-    def _make_card(self, parent, title, subtitle, initial_value):
-        """Build one data card and return a controller object so we can update its value later."""
-        frame = tk.Frame(parent, bg=CARD_BG, pady=12, padx=12)
-        tk.Label(frame, text=title,    bg=CARD_BG, fg=SUBTEXT,  font=("Segoe UI", 9)).pack(anchor="w")
-        tk.Label(frame, text=subtitle, bg=CARD_BG, fg=SUBTEXT,  font=("Segoe UI", 8)).pack(anchor="w")
-        value_var = tk.StringVar(value=initial_value)
-        tk.Label(frame, textvariable=value_var,
-                 bg=CARD_BG, fg=TEXT,
-                 font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(4, 0))
-        frame.value_var = value_var    # stash the var on the frame so callers can reach it
-        return frame
+        # Tell each card to dim while loading (keeps last known value visible)
+        self.oil_card.loading()
+        self.fx_card.loading()
+        self.weather_card.loading()
 
-    def _center_window(self, w, h):
-        """Position the window in the middle of the screen on startup."""
+        threading.Thread(target=self._fetch_in_background, daemon=True).start()
+
+
+    def _fetch_in_background(self):
+        """Runs on the background thread — one network call that gets all three."""
+        result = fetch_and_save()
+        self.after(0, lambda: self._update_display(result))
+
+
+    def _update_display(self, result):
+        """Runs back on the main thread — updates every card and the status bar."""
+        oil     = result.get("oil_usd_per_barrel")
+        rate    = result.get("usd_inr_rate")
+        weather = result.get("weather") or {}
+        ts      = result.get("timestamp", "")
+        failures = 0
+
+        # ── Oil card ──────────────────────────────────────────────────────────
+        if oil is not None:
+            self.oil_card.normal(f"${oil}", "")
+        else:
+            failures += 1
+            reason = FETCH_ERRORS.get("oil", "Unknown error")
+            soft   = reason is not None and "closed" in reason.lower()
+            self.oil_card.error(reason, soft=soft)
+
+        # ── FX card ───────────────────────────────────────────────────────────
+        if rate is not None:
+            self.fx_card.normal(f"{rate}", "")
+        else:
+            failures += 1
+            reason = FETCH_ERRORS.get("fx", "Unknown error")
+            soft   = reason is not None and "closed" in reason.lower()
+            self.fx_card.error(reason, soft=soft)
+
+        # ── Weather card ──────────────────────────────────────────────────────
+        if weather:
+            temp = weather.get("temp_c", "—")
+            desc = weather.get("description", "").capitalize()
+            hum  = weather.get("humidity_pct", "—")
+            wind = weather.get("wind_kph", "—")
+            self.weather_card.normal(str(temp),
+                                     f"{desc}  ·  Humidity {hum}%  ·  Wind {wind} kph")
+        else:
+            failures += 1
+            reason = FETCH_ERRORS.get("weather", "Unknown error")
+            self.weather_card.error(reason)
+
+        # ── Status bar ────────────────────────────────────────────────────────
+        if failures == 0:
+            self.status_var.set(f"✅  Saved at {ts}")
+        elif failures == 3:
+            self.status_var.set("❌  All sources failed — check internet connection")
+        else:
+            self.status_var.set(f"⚠   {failures} source(s) failed — see cards above  |  {ts}")
+
+        # ── Re-enable button after cooldown ───────────────────────────────────
+        # after(ms, fn) schedules fn to run after ms milliseconds on main thread
+        self.after(COOLDOWN_MS, self._re_enable_button)
+
+
+    def _re_enable_button(self):
+        self.btn.config(text="  🔄  FETCH & SAVE  ", state="normal", bg=C_BTN)
+
+
+    # ── UTILITY ───────────────────────────────────────────────────────────────
+
+    def _center_on_screen(self):
         self.update_idletasks()
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
-        x = (sw - w) // 2
-        y = (sh - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
-
-    # ---------- fetch logic ----------
-
-    def _on_fetch(self):
-        """Called when the button is clicked. Disables the button, then starts a background thread."""
-        self.btn.config(state="disabled", text="Fetching...", bg=SUBTEXT)
-        self.status_var.set("Contacting APIs...")
-        # Run the slow network calls in a separate thread so the window stays responsive
-        threading.Thread(target=self._fetch_worker, daemon=True).start()
-
-    def _fetch_worker(self):
-        """
-        Runs in a background thread. Calls all three APIs and saves results.
-        Never touches tkinter widgets directly -- schedules updates with .after(0, ...).
-        """
-        try:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            oil     = get_crude_oil_price()
-            rate    = get_usd_exchange_rate()
-            weather = get_weather()
-
-            record = {
-                "timestamp":          timestamp,
-                "oil_usd_per_barrel": oil,
-                "usd_to_inr":         rate,
-                "weather":            weather,
-            }
-            save_snapshot(record)
-            append_to_log(record)
-
-            # Schedule the UI update back on the main thread
-            self.after(0, lambda: self._update_ui(record))
-
-        except Exception as e:
-            self.after(0, lambda: self._show_error(str(e)))
-
-    def _update_ui(self, record):
-        """Called on the main thread after a successful fetch. Updates all cards and the log."""
-        oil     = record["oil_usd_per_barrel"]
-        rate    = record["usd_to_inr"]
-        weather = record["weather"] or {}
-        ts      = record["timestamp"]
-
-        self.card_oil.value_var.set(f"{oil} USD" if oil else "Error")
-        self.card_fx.value_var.set(f"{rate}" if rate else "Error")
-        self.card_weather.value_var.set(
-            f"{weather.get('temperature_c', '--')}\u00b0C" if weather else "Error"
-        )
-
-        wind = weather.get("windspeed_kph", "?")
-        log_line = f"[{ts}]  Oil: {oil}  |  USD\u2192{TARGET_CURRENCY}: {rate}  |  {weather.get('temperature_c','?')}\u00b0C  wind {wind} kph\n"
-        self.log_box.config(state="normal")
-        self.log_box.insert("end", log_line)
-        self.log_box.see("end")          # scroll to the latest entry
-        self.log_box.config(state="disabled")
-
-        self.status_var.set(f"Last fetched: {ts}  |  Saved to data/")
-        self.btn.config(state="normal", text="Fetch Now", bg=ACCENT)
+        w = self.winfo_width()
+        h = self.winfo_height()
+        x = (self.winfo_screenwidth()  - w) // 2
+        y = (self.winfo_screenheight() - h) // 2
+        self.geometry(f"+{x}+{y}")
 
 
-    def _show_error(self, msg):
-        """Called on the main thread if the fetch thread crashes."""
-        self.status_var.set(f"Error: {msg}")
-        self.btn.config(state="normal", text="Fetch Now", bg=WARNING)
-
-
-# =================== ENTRY POINT ===================
-
+# ── ENTRY POINT ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()    # hands control to tkinter; it listens for clicks/keypresses until the window closes
+    app = MonitorApp()
+    app.mainloop()
