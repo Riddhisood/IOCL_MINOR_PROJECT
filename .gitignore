@@ -1,0 +1,13 @@
+# Secrets — NEVER commit
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Data logs (remove these two lines if you want Git to track your logs)
+data_logs/
+
+# OS junk
+.DS_Store
+Thumbs.db
